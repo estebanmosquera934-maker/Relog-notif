@@ -1,0 +1,706 @@
+name: Compilar Reloj Notif
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Crear el proyecto
+        run: |
+          mkdir -p watchapp && cd watchapp
+          mkdir -p app
+          cat > app/build.gradle.kts <<'KOTLIN_EOF_0'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.watchnotify"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.watchnotify"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          KOTLIN_EOF_0
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'KOTLIN_EOF_1'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+              <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+              <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+              <application
+                  android:label="Reloj Notif"
+                  android:icon="@android:drawable/sym_def_app_icon"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".WatchService" android:exported="false"
+                      android:foregroundServiceType="connectedDevice" />
+                  <service android:name=".NotifListener" android:exported="true"
+                      android:label="Reloj Notif"
+                      android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.service.notification.NotificationListenerService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          KOTLIN_EOF_1
+          mkdir -p app/src/main/java/com/watchnotify
+          cat > app/src/main/java/com/watchnotify/Common.kt <<'KOTLIN_EOF_2'
+          package com.watchnotify
+
+          import android.content.Context
+
+          data class AppDef(val key: String, val name: String, val code: Int, val pkgs: List<String>, val def: Boolean = true)
+
+          val APPS = listOf(
+              AppDef("wa", "WhatsApp", 8, listOf("com.whatsapp", "com.whatsapp.w4b")),
+              AppDef("tg", "Telegram", 18, listOf("org.telegram.messenger", "org.telegram.messenger.web")),
+              AppDef("sms", "Mensajes (SMS)", 1, listOf("com.google.android.apps.messaging", "com.android.mms", "com.samsung.android.messaging", "com.android.messaging")),
+              AppDef("ig", "Instagram", 16, listOf("com.instagram.android")),
+              AppDef("fb", "Facebook", 4, listOf("com.facebook.katana")),
+              AppDef("ms", "Messenger", 23, listOf("com.facebook.orca")),
+              AppDef("x", "X (Twitter)", 5, listOf("com.twitter.android")),
+              AppDef("sc", "Snapchat", 10, listOf("com.snapchat.android")),
+              AppDef("tt", "TikTok", 11, listOf("com.zhiliaoapp.musically", "com.ss.android.ugc.trill")),
+              AppDef("li", "LinkedIn", 17, listOf("com.linkedin.android")),
+              AppDef("ln", "Line", 7, listOf("jp.naver.line.android")),
+              AppDef("vb", "Viber", 22, listOf("com.viber.voip")),
+              AppDef("sk", "Skype", 6, listOf("com.skype.raider")),
+              AppDef("gm", "Gmail (aparece como SMS)", 1, listOf("com.google.android.gm"), false)
+          )
+
+          val SEPS = listOf(": ", " – ", "\n", " ")
+
+          fun cut(s: String, max: Int): String {
+              var n = max
+              val sb = StringBuilder()
+              var i = 0
+              while (i < s.length) {
+                  if (n <= 0) break
+                  val cp = s.codePointAt(i)
+                  if (cp > 127) {
+                      n -= 2
+                      if (n < 0) break
+                  } else {
+                      n--
+                  }
+                  sb.appendCodePoint(cp)
+                  i += Character.charCount(cp)
+              }
+              return sb.toString()
+          }
+
+          object Prefs {
+              private fun p(c: Context) = c.getSharedPreferences("p", Context.MODE_PRIVATE)
+              fun addr(c: Context): String? = p(c).getString("addr", null)
+              fun setAddr(c: Context, a: String?) { p(c).edit().putString("addr", a).apply() }
+              fun on(c: Context): Boolean = p(c).getBoolean("on", false)
+              fun setOn(c: Context, v: Boolean) { p(c).edit().putBoolean("on", v).apply() }
+              fun sepIdx(c: Context): Int = p(c).getInt("sep", 0).coerceIn(0, SEPS.size - 1)
+              fun setSepIdx(c: Context, v: Int) { p(c).edit().putInt("sep", v).apply() }
+              fun sep(c: Context): String = SEPS[sepIdx(c)]
+              fun max(c: Context): Int = p(c).getInt("max", 300)
+              fun setMax(c: Context, v: Int) { p(c).edit().putInt("max", v).apply() }
+              fun appOn(c: Context, d: AppDef): Boolean = p(c).getBoolean("app_" + d.key, d.def)
+              fun setApp(c: Context, d: AppDef, v: Boolean) { p(c).edit().putBoolean("app_" + d.key, v).apply() }
+          }
+          KOTLIN_EOF_2
+          mkdir -p app/src/main/java/com/watchnotify
+          cat > app/src/main/java/com/watchnotify/MainActivity.kt <<'KOTLIN_EOF_3'
+          package com.watchnotify
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.bluetooth.BluetoothDevice
+          import android.bluetooth.BluetoothManager
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Typeface
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.View
+          import android.widget.AdapterView
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Spinner
+          import android.widget.Switch
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              private lateinit var status: TextView
+              private lateinit var logv: TextView
+              private lateinit var spWatch: Spinner
+              private lateinit var edMax: EditText
+              private var devs: List<BluetoothDevice> = emptyList()
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun hasBt(): Boolean =
+                  Build.VERSION.SDK_INT < 31 ||
+                      checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(dp(18), dp(18), dp(18), dp(32))
+                  val sv = ScrollView(this)
+                  sv.addView(root)
+                  setContentView(sv)
+
+                  fun label(t: String, size: Float = 14f, bold: Boolean = false): TextView {
+                      val v = TextView(this)
+                      v.text = t
+                      v.textSize = size
+                      if (bold) v.setTypeface(null, Typeface.BOLD)
+                      v.setPadding(0, dp(10), 0, dp(4))
+                      root.addView(v)
+                      return v
+                  }
+
+                  fun button(t: String, f: () -> Unit) {
+                      val v = Button(this)
+                      v.text = t
+                      v.setOnClickListener { f() }
+                      root.addView(v)
+                  }
+
+                  label("Reloj Notif", 24f, true)
+                  label("Envía las notificaciones de tu teléfono al reloj con título y texto completos.")
+                  label("Estado", 16f, true)
+                  status = label("")
+
+                  label("Paso 1: permisos", 16f, true)
+                  button("Dar permisos de Bluetooth y avisos") { askPerms() }
+                  button("Dar acceso a notificaciones") {
+                      startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                  }
+                  button("Quitar límite de batería") { battery() }
+
+                  label("Paso 2: elegir el reloj (debe estar emparejado)", 16f, true)
+                  spWatch = Spinner(this)
+                  root.addView(spWatch)
+                  button("Actualizar lista") { loadDevs() }
+
+                  label("Paso 3: conectar", 16f, true)
+                  button("Conectar y activar") { start() }
+                  button("Desconectar y pausar") { stop() }
+
+                  label("Formato", 16f, true)
+                  label("Separar título y mensaje con")
+                  val spSep = Spinner(this)
+                  spSep.adapter = ArrayAdapter(
+                      this, android.R.layout.simple_spinner_dropdown_item,
+                      listOf("Dos puntos", "Guion largo", "Salto de línea", "Espacio")
+                  )
+                  spSep.setSelection(Prefs.sepIdx(this))
+                  spSep.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                      override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                          Prefs.setSepIdx(this@MainActivity, pos)
+                      }
+                      override fun onNothingSelected(p: AdapterView<*>?) {}
+                  }
+                  root.addView(spSep)
+                  label("Máximo de caracteres por mensaje")
+                  edMax = EditText(this)
+                  edMax.inputType = InputType.TYPE_CLASS_NUMBER
+                  edMax.setText(Prefs.max(this).toString())
+                  root.addView(edMax)
+
+                  label("Apps que pasan al reloj", 16f, true)
+                  for (d in APPS) {
+                      val sw = Switch(this)
+                      sw.text = d.name
+                      sw.isChecked = Prefs.appOn(this, d)
+                      sw.setOnCheckedChangeListener { _, v -> Prefs.setApp(this@MainActivity, d, v) }
+                      root.addView(sw)
+                  }
+
+                  label("Pruebas y registro", 16f, true)
+                  button("Enviar mensaje de prueba") {
+                      Watch.send(8, "Prueba: ¿se ve bien? áéíóú ñ")
+                  }
+                  logv = label("", 12f)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  Watch.onChange = { runOnUiThread { refresh() } }
+                  loadDevs()
+                  refresh()
+              }
+
+              override fun onPause() {
+                  saveMax()
+                  Watch.onChange = null
+                  super.onPause()
+              }
+
+              override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, res: IntArray) {
+                  super.onRequestPermissionsResult(code, perms, res)
+                  loadDevs()
+                  refresh()
+              }
+
+              private fun saveMax() {
+                  val v = edMax.text.toString().toIntOrNull()
+                  if (v != null) Prefs.setMax(this, v.coerceIn(20, 1000))
+              }
+
+              private fun toast(t: String) {
+                  Toast.makeText(this, t, Toast.LENGTH_LONG).show()
+              }
+
+              private fun askPerms() {
+                  val p = mutableListOf<String>()
+                  if (Build.VERSION.SDK_INT >= 31) p.add(Manifest.permission.BLUETOOTH_CONNECT)
+                  if (Build.VERSION.SDK_INT >= 33) p.add(Manifest.permission.POST_NOTIFICATIONS)
+                  if (p.isNotEmpty()) requestPermissions(p.toTypedArray(), 1)
+              }
+
+              private fun battery() {
+                  try {
+                      startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + packageName)))
+                  } catch (e: Exception) {
+                      startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                  }
+              }
+
+              @SuppressLint("MissingPermission")
+              private fun loadDevs() {
+                  devs = if (hasBt()) {
+                      val ad = getSystemService(BluetoothManager::class.java)?.adapter
+                      (ad?.bondedDevices?.toList() ?: emptyList()).sortedBy { it.name ?: "" }
+                  } else {
+                      emptyList()
+                  }
+                  val names = devs.map { (it.name ?: "Sin nombre") + " (" + it.address + ")" }
+                  spWatch.adapter = ArrayAdapter(
+                      this, android.R.layout.simple_spinner_dropdown_item,
+                      if (names.isEmpty()) listOf("Ninguno: da permisos y toca Actualizar lista") else names
+                  )
+                  val saved = Prefs.addr(this)
+                  var i = devs.indexOfFirst { it.address == saved }
+                  if (i < 0) i = devs.indexOfFirst { (it.name ?: "").contains("ULTRA", true) }
+                  if (i >= 0) spWatch.setSelection(i)
+              }
+
+              private fun start() {
+                  val i = spWatch.selectedItemPosition
+                  if (!hasBt() || devs.isEmpty() || i < 0 || i >= devs.size) {
+                      toast("Primero da los permisos y elige un reloj emparejado")
+                      return
+                  }
+                  saveMax()
+                  Prefs.setAddr(this, devs[i].address)
+                  Prefs.setOn(this, true)
+                  startForegroundService(Intent(this, WatchService::class.java))
+                  refresh()
+              }
+
+              private fun stop() {
+                  Prefs.setOn(this, false)
+                  stopService(Intent(this, WatchService::class.java))
+                  Watch.disconnect()
+                  refresh()
+              }
+
+              private fun refresh() {
+                  val ls = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
+                  val listener = ls != null && ls.contains(packageName)
+                  val sb = StringBuilder()
+                  sb.append("Reloj: ").append(Watch.status).append("\n")
+                  sb.append("Bluetooth: ").append(if (hasBt()) "permiso dado" else "falta el permiso").append("\n")
+                  sb.append("Acceso a notificaciones: ").append(if (listener) "activado" else "falta activarlo").append("\n")
+                  sb.append("Envío: ").append(if (Prefs.on(this)) "activo" else "pausado")
+                  status.text = sb.toString()
+                  logv.text = Watch.history().joinToString("\n")
+              }
+          }
+          KOTLIN_EOF_3
+          mkdir -p app/src/main/java/com/watchnotify
+          cat > app/src/main/java/com/watchnotify/NotifListener.kt <<'KOTLIN_EOF_4'
+          package com.watchnotify
+
+          import android.app.Notification
+          import android.service.notification.NotificationListenerService
+          import android.service.notification.StatusBarNotification
+
+          class NotifListener : NotificationListenerService() {
+              private var lastKey = ""
+              private var lastText = ""
+              private var lastTime = 0L
+
+              override fun onListenerConnected() {
+                  super.onListenerConnected()
+                  if (Prefs.on(this)) {
+                      Prefs.addr(this)?.let { Watch.connect(applicationContext, it) }
+                  }
+              }
+
+              override fun onNotificationPosted(sbn: StatusBarNotification) {
+                  if (!Prefs.on(this)) return
+                  if (sbn.packageName == packageName) return
+                  val n = sbn.notification
+                  if (sbn.isOngoing || (n.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
+                  val def = APPS.firstOrNull { sbn.packageName in it.pkgs } ?: return
+                  if (!Prefs.appOn(this, def)) return
+                  val ex = n.extras
+                  val title = ex.getCharSequence("android.title")?.toString()?.trim().orEmpty()
+                  val big = ex.getCharSequence("android.bigText")?.toString()?.trim()
+                  val small = ex.getCharSequence("android.text")?.toString()?.trim()
+                  val body = (if (!big.isNullOrEmpty()) big else small).orEmpty()
+                  if (title.isEmpty() && body.isEmpty()) return
+                  val full = if (title.isNotEmpty() && body.isNotEmpty()) title + Prefs.sep(this) + body else title + body
+                  val text = cut(full, Prefs.max(this))
+                  val now = System.currentTimeMillis()
+                  if (sbn.key == lastKey && text == lastText && now - lastTime < 3000) return
+                  lastKey = sbn.key
+                  lastText = text
+                  lastTime = now
+                  Watch.send(def.code, text)
+              }
+          }
+          KOTLIN_EOF_4
+          mkdir -p app/src/main/java/com/watchnotify
+          cat > app/src/main/java/com/watchnotify/Watch.kt <<'KOTLIN_EOF_5'
+          package com.watchnotify
+
+          import android.annotation.SuppressLint
+          import android.bluetooth.BluetoothDevice
+          import android.bluetooth.BluetoothGatt
+          import android.bluetooth.BluetoothGattCallback
+          import android.bluetooth.BluetoothGattCharacteristic
+          import android.bluetooth.BluetoothGattDescriptor
+          import android.bluetooth.BluetoothManager
+          import android.bluetooth.BluetoothProfile
+          import android.content.Context
+          import android.os.Handler
+          import android.os.Looper
+          import java.util.UUID
+
+          @SuppressLint("MissingPermission")
+          object Watch {
+              private val SVC = UUID.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9d")
+              private val WR = UUID.fromString("6e400002-b5a3-f393-e0a9-e50e24dcca9d")
+              private val NT = UUID.fromString("6e400003-b5a3-f393-e0a9-e50e24dcca9d")
+              private val CCCD = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+              private val main = Handler(Looper.getMainLooper())
+              private val lines = ArrayDeque<String>()
+              private val q = ArrayDeque<ByteArray>()
+              private var ctx: Context? = null
+              private var addr: String? = null
+              private var gatt: BluetoothGatt? = null
+              private var wc: BluetoothGattCharacteristic? = null
+              private var writing = false
+              private var want = false
+              private var auto = false
+              private var wd = 0
+
+              var ready = false
+                  private set
+              var status = "Sin conectar"
+                  private set
+              var onChange: (() -> Unit)? = null
+
+              fun history(): List<String> = lines.toList()
+
+              private fun addLine(s: String) {
+                  lines.addLast(s)
+                  while (lines.size > 40) lines.removeFirst()
+              }
+
+              private fun log(s: String) {
+                  main.post { addLine(s); onChange?.invoke() }
+              }
+
+              private fun setStatus(s: String) {
+                  status = s
+                  addLine(s)
+                  onChange?.invoke()
+              }
+
+              fun connect(c: Context, a: String) {
+                  main.post {
+                      ctx = c.applicationContext
+                      if (want && addr == a && gatt != null) return@post
+                      addr = a
+                      want = true
+                      auto = false
+                      open()
+                  }
+              }
+
+              fun disconnect() {
+                  main.post {
+                      want = false
+                      closeGatt()
+                      setStatus("Pausado")
+                  }
+              }
+
+              private fun retry() {
+                  if (want) main.postDelayed({ if (want && gatt == null) open() }, 6000)
+              }
+
+              private fun closeGatt() {
+                  try { gatt?.close() } catch (e: Exception) { }
+                  gatt = null
+                  wc = null
+                  ready = false
+                  q.clear()
+                  writing = false
+              }
+
+              private fun open() {
+                  val c = ctx ?: return
+                  val a = addr ?: return
+                  closeGatt()
+                  try {
+                      val ad = c.getSystemService(BluetoothManager::class.java)?.adapter
+                      if (ad == null || !ad.isEnabled) {
+                          setStatus("Bluetooth apagado")
+                          retry()
+                          return
+                      }
+                      setStatus("Conectando…")
+                      gatt = ad.getRemoteDevice(a).connectGatt(c, auto, cb, BluetoothDevice.TRANSPORT_LE)
+                  } catch (e: Exception) {
+                      setStatus("Error: " + e.message)
+                      retry()
+                  }
+              }
+
+              private fun markReady() {
+                  main.post {
+                      ready = true
+                      setStatus("Conectado")
+                  }
+              }
+
+              private val cb = object : BluetoothGattCallback() {
+                  override fun onConnectionStateChange(g: BluetoothGatt, st: Int, newState: Int) {
+                      if (newState == BluetoothProfile.STATE_CONNECTED) {
+                          main.post { setStatus("Buscando servicios…") }
+                          g.discoverServices()
+                      } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                          main.post {
+                              if (g !== gatt) return@post
+                              closeGatt()
+                              setStatus("Desconectado (código " + st + ")")
+                              if (want) {
+                                  auto = true
+                                  retry()
+                              }
+                          }
+                      }
+                  }
+
+                  override fun onServicesDiscovered(g: BluetoothGatt, st: Int) {
+                      val s = g.getService(SVC)
+                      val w = s?.getCharacteristic(WR)
+                      val n = s?.getCharacteristic(NT)
+                      if (w == null || n == null) {
+                          main.post { setStatus("El dispositivo no tiene el servicio esperado") }
+                          return
+                      }
+                      wc = w
+                      g.setCharacteristicNotification(n, true)
+                      val d = n.getDescriptor(CCCD)
+                      if (d != null) {
+                          d.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                          g.writeDescriptor(d)
+                      } else {
+                          markReady()
+                      }
+                  }
+
+                  override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, st: Int) {
+                      markReady()
+                  }
+
+                  override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, st: Int) {
+                      main.post {
+                          writing = false
+                          pump()
+                      }
+                  }
+
+                  override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
+                      val v = c.getValue()
+                      if (v != null) log("← " + v.joinToString(" ") { "%02x".format(it) })
+                  }
+              }
+
+              fun send(app: Int, text: String) {
+                  val body = text.toByteArray(Charsets.UTF_8)
+                  val p = byteArrayOf(app.toByte(), 0, 0) + body
+                  val total = p.size + 8
+                  val head = byteArrayOf(
+                      0xCD.toByte(), ((total - 3) shr 8).toByte(), (total - 3).toByte(),
+                      0x12, 1, 0x12, (p.size shr 8).toByte(), p.size.toByte()
+                  )
+                  val pk = head + p
+                  main.post {
+                      if (!ready) {
+                          addLine("No conectado: mensaje descartado")
+                          onChange?.invoke()
+                          return@post
+                      }
+                      addLine("→ app " + app + ", " + pk.size + " bytes")
+                      var i = 0
+                      while (i < pk.size) {
+                          q.addLast(pk.copyOfRange(i, minOf(i + 20, pk.size)))
+                          i += 20
+                      }
+                      onChange?.invoke()
+                      pump()
+                  }
+              }
+
+              private fun pump() {
+                  if (writing) return
+                  val chunk = q.removeFirstOrNull() ?: return
+                  val ch = wc ?: return
+                  val g = gatt ?: return
+                  writing = true
+                  val id = ++wd
+                  main.postDelayed({
+                      if (writing && wd == id) {
+                          writing = false
+                          q.clear()
+                          addLine("Tiempo agotado al enviar")
+                          onChange?.invoke()
+                      }
+                  }, 3000)
+                  ch.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                  ch.setValue(chunk)
+                  if (!g.writeCharacteristic(ch)) {
+                      writing = false
+                      q.clear()
+                      addLine("Fallo al escribir")
+                      onChange?.invoke()
+                  }
+              }
+          }
+          KOTLIN_EOF_5
+          mkdir -p app/src/main/java/com/watchnotify
+          cat > app/src/main/java/com/watchnotify/WatchService.kt <<'KOTLIN_EOF_6'
+          package com.watchnotify
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.IBinder
+
+          class WatchService : Service() {
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("watch", "Conexión con el reloj", NotificationManager.IMPORTANCE_LOW))
+                  val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+                  val n = Notification.Builder(this, "watch")
+                      .setContentTitle("Reloj Notif activo")
+                      .setContentText("Enviando notificaciones al reloj")
+                      .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+                      .setContentIntent(pi)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+                  } else {
+                      startForeground(1, n)
+                  }
+                  Prefs.addr(this)?.let { Watch.connect(this, it) }
+                  return START_STICKY
+              }
+
+              override fun onDestroy() {
+                  Watch.disconnect()
+                  super.onDestroy()
+              }
+          }
+          KOTLIN_EOF_6
+          cat > build.gradle.kts <<'KOTLIN_EOF_7'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          KOTLIN_EOF_7
+          cat > gradle.properties <<'KOTLIN_EOF_8'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          KOTLIN_EOF_8
+          cat > settings.gradle.kts <<'KOTLIN_EOF_9'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "RelojNotif"
+          include(":app")
+          KOTLIN_EOF_9
+      - name: Aceptar licencias del SDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+      - name: Compilar
+        working-directory: watchapp
+        run: gradle assembleDebug --no-daemon --stacktrace
+      - name: Guardar copia del APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RelojNotif-apk
+          path: watchapp/app/build/outputs/apk/debug/app-debug.apk
+      - name: Publicar el APK en Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp watchapp/app/build/outputs/apk/debug/app-debug.apk RelojNotif.apk
+          gh release create "build-${{ github.run_number }}" RelojNotif.apk --repo "${{ github.repository }}" --title "Reloj Notif ${{ github.run_number }}" --notes "APK de prueba. Descarga RelojNotif.apk e instálalo."
